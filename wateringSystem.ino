@@ -4,14 +4,18 @@
 #include <ThingsBoard.h>
 #include <ArduinoJson.h>
 #include <DHT.h> 
+#include <ESPAsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <WebSerial.h>
 
 
 
 #define DHTTYPE             DHT22
 
 // PINOUTs
-const int PUMP_RELAY_PIN = 16;
-const int DHT_PIN = 5;
+const int PUMP_RELAY_PIN = 5;
+const int DHT_PIN = 4;
+const int MOISTURE_PIN = A0;
 
 // Time variables
 WiFiUDP ntpUDP;
@@ -31,10 +35,16 @@ ThingsBoard tb(wifiClient);
 const long WATERING_TIME_IN_MS = 1000 * 5;
 boolean triggerManuallyWateringFlag = false;
 
+// WIFI Serial
+AsyncWebServer serialServer(80);
+
 // Sensors
+const int moistureAirValue = 620;
+const int moistureWaterValue = 310;
+int moistureValue = 0;
+int moisturePercent = 0;
 float temperature = 0;
 float humidity = 0;
-float moisture = 0;
 float current = 0;
 float batteryVoltage = 0;
 
@@ -44,10 +54,12 @@ void setup() {
   Serial.begin(115200);
   dht.begin();
   pinMode(PUMP_RELAY_PIN, OUTPUT);
+  digitalWrite(PUMP_RELAY_PIN, HIGH); // stop pump manually without using stopPump(), because we use there WebSerial with WIFI
   
-  stopPump();
-
   delay(10);
+  WebSerial.begin(&serialServer);
+  serialServer.begin();
+  delay(100);
   reconnect();
   timeClient.update();
 }
@@ -65,12 +77,22 @@ void loop() {
   if (needsWatering()) {
     waterPlants();
   }
-  // TODO delete the delay
-  delay(5000);
+  delay(500);
+  if (isNight() || lowBattery()) {
+    WebSerial.println("Going deep sleep");
+    tb.sendTelemetryBool("deepSlep", true);
+    delay(500);
+    ESP.deepSleep(5 * 60e6); // 5 minutes 
+  }
+  else {
+    tb.sendTelemetryBool("deepSlep", false);
+    delay(5000);
+  }
 }
 
 /* --------------- WATERING --------------- */
 boolean needsWatering() {
+  // trigger watering at 9 AM
   if ((hourNow() == 9 && hourSinceLastWatering > 10) || triggeredManually()) {
     triggerManuallyWateringFlag = false;
     hourSinceLastWatering = hourNow();
@@ -95,15 +117,15 @@ void waterPlants() {
 }
 
 void startPump() {
-  Serial.print(timeNow());
-  Serial.println(": starting pump...");
-  digitalWrite(PUMP_RELAY_PIN, HIGH);
+  WebSerial.print(timeNow());
+  WebSerial.println(": starting pump...");
+  digitalWrite(PUMP_RELAY_PIN, LOW);
 }
 
 void stopPump() {
-  Serial.print(timeNow());
-  Serial.println(": stopping pump...");
-  digitalWrite(PUMP_RELAY_PIN, LOW);  
+  WebSerial.print(timeNow());
+  WebSerial.println(": stopping pump...");
+  digitalWrite(PUMP_RELAY_PIN, HIGH);  
 }
 
 
@@ -111,12 +133,29 @@ void stopPump() {
 void measureSensorValues() {
   temperature = dht.readTemperature();
   humidity = dht.readHumidity();
+  /* TODO
+  moistureValue = analogRead(A0);
+  WebSerial.print("Moisture: ");
+  WebSerial.println(analogRead(MOISTURE_PIN));
+  moisturePercent = map(moistureValue, moistureAirValue, moistureWaterValue, 0, 100);
+  */
+  delay(5);
+  measureBatteryVoltage();
+}
+
+void measureBatteryVoltage() {
+  float calibration = -0.13;
+  float refVoltage = 4.8;
+  int adcValue = analogRead(A0);
+  delay(5);
+  float adcVoltage  = (adcValue * refVoltage) / 1024.0; 
+  batteryVoltage = adcVoltage + calibration;
 }
 
 /* --------------- MQQT --------------- */
 
 RPC_Response wateringButtonTriggered(const RPC_Data &data) {
-  Serial.println("Received watering trigger from server");
+  WebSerial.println("Received watering trigger from server");
   triggerManuallyWateringFlag = true;
   return RPC_Response(NULL, triggerManuallyWateringFlag);
 }
@@ -128,6 +167,10 @@ RPC_Callback callbacks[callbacks_size] = {
 
 /* --------------- MISC --------------- */
 
+boolean lowBattery() {
+  return batteryVoltage < 3.2;
+}
+
 void initWiFi() {
   Serial.println("Connecting to AP ...");
   WiFi.begin(WIFI_AP, WIFI_PASSWORD);
@@ -136,6 +179,7 @@ void initWiFi() {
     Serial.print(".");
   }
   Serial.println("Connected to AP");
+  delay(5000); // needed to initalize the WebSerial
 }
 
 void reconnect() {
@@ -144,18 +188,18 @@ void reconnect() {
     if (WiFi.status() != WL_CONNECTED) {
       initWiFi();
     }
-    Serial.print("Connecting to ThingsBoard node ...");
+    WebSerial.print("Connecting to ThingsBoard node ...");
     if (tb.connect(thingsboardServer, TOKEN) ) {
-      Serial.println( "[DONE]" );
-      Serial.println("Subscribing for RPC...");
+      WebSerial.println( "[DONE]" );
+      WebSerial.println("Subscribing for RPC...");
 
       // Perform a subscription
       if (!tb.RPC_Subscribe(callbacks, callbacks_size)) {
-        Serial.println("Failed to subscribe for RPC");
+        WebSerial.println("Failed to subscribe for RPC");
       }
     } else {
-      Serial.print( "[FAILED]" );
-      Serial.println( ": retrying in 5 seconds]" );
+      WebSerial.print( "[FAILED]" );
+      WebSerial.println( ": retrying in 5 seconds]" );
       // Wait 5 seconds before retrying
       delay(5000);
     }
@@ -163,14 +207,22 @@ void reconnect() {
 }
 
 void sendTelemetry() {
+  WebSerial.println(timeNow());
+  WebSerial.print("Temp: ");
+  WebSerial.print(temperature);
+  WebSerial.print(" *C. Hum: ");
+  WebSerial.print(humidity);
+  WebSerial.print(" %. Batt: ");
+  WebSerial.print(batteryVoltage);
+  WebSerial.println(" V.");
+
   tb.sendTelemetryFloat("temperature", temperature);
   tb.sendTelemetryFloat("humidity", humidity);
-
-  Serial.print("Temp: ");
-  Serial.println(temperature);
-  Serial.print("Hum: ");
-  Serial.println(humidity);
-  Serial.println("Telemetry sent.");
+  tb.sendTelemetryFloat("batteryVoltage", batteryVoltage);
+  char timeCharBuf[50];
+  timeNow().toCharArray(timeCharBuf, 50);
+  tb.sendTelemetryString("requestTime", timeCharBuf);
+  WebSerial.println("Telemetry sent.");
 }
 
 /* --------------- TIME MANAGEMENT --------------- */
@@ -179,12 +231,12 @@ void synchroniseTime() {
   int hoursSinceLastSync = abs(timeClient.getHours() - lastSyncHour);
   /*
   Used to debug:
-  Serial.print("hours since last sync: ");
-  Serial.println(hoursSinceLastSync);
-  Serial.println(timeNow());
+  WebSerial.print("hours since last sync: ");
+  WebSerial.println(hoursSinceLastSync);
+  WebSerial.println(timeNow());
     */
   if (hoursSinceLastSync > 10) {
-    Serial.println("Time synced");
+    WebSerial.println("Time synced");
     timeClient.update();
     lastSyncHour = timeClient.getHours();
   }
@@ -196,4 +248,8 @@ int hourNow() {
 
 String timeNow() {
   return timeClient.getFormattedTime();
+}
+
+boolean isNight() {
+  return hourNow() < 6 || hourNow() > 21;
 }
