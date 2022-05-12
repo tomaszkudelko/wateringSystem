@@ -7,14 +7,19 @@
 #include <ESPAsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <WebSerial.h>
+#include <Adafruit_ADS1X15.h>
+#include <Wire.h>
 
 
 
 #define DHTTYPE             DHT22
 
 // PINOUTs
-const int PUMP_RELAY_PIN = 5;
-const int DHT_PIN = 4;
+Adafruit_ADS1115 ads;	
+const int PUMP_RELAY_PIN = 12;
+const int DHT_PIN = 14;
+const int SCL_PIN = 5;
+const int SDA_PIN = 4;
 const int MOISTURE_PIN = A0;
 
 // Time variables
@@ -22,7 +27,8 @@ WiFiUDP ntpUDP;
 const long utcOffsetInSeconds = 7200;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffsetInSeconds);
 int lastSyncHour = 0;
-int hourSinceLastWatering = 0;
+int hourOfTheLastWatering = 0;
+String timeOfTheLastWatering = "";
 
 // Thingsboard
 char thingsboardServer[] = "107.173.15.229";
@@ -32,17 +38,17 @@ ThingsBoard tb(wifiClient);
 
 // Watering variables
 // TODO change to 60s
-const long WATERING_TIME_IN_MS = 1000 * 5;
+const long WATERING_TIME_IN_MS = 1000 * 30;
 boolean triggerManuallyWateringFlag = false;
 
 // WIFI Serial
 AsyncWebServer serialServer(80);
 
 // Sensors
-const int moistureAirValue = 620;
-const int moistureWaterValue = 310;
-int moistureValue = 0;
-int moisturePercent = 0;
+const int moistureAirValue = 6900;
+const int moistureWaterValue = 4800;
+int soilMoisturePercent = 0;
+int waterLevelMoisturePercent = 0;
 float temperature = 0;
 float humidity = 0;
 float current = 0;
@@ -53,6 +59,7 @@ DHT dht(DHT_PIN, DHTTYPE);
 void setup() {
   Serial.begin(115200);
   dht.begin();
+  ads.begin();
   pinMode(PUMP_RELAY_PIN, OUTPUT);
   digitalWrite(PUMP_RELAY_PIN, HIGH); // stop pump manually without using stopPump(), because we use there WebSerial with WIFI
   
@@ -78,9 +85,11 @@ void loop() {
     waterPlants();
   }
   delay(500);
-  if (isNight() || lowBattery()) {
+  if (false) {
+    // TODO
+  //if (isNight() || lowBattery()) {
     WebSerial.println("Going deep sleep");
-    tb.sendTelemetryBool("deepSlep", true);
+    tb.sendTelemetryBool("deepSleep", true);
     delay(500);
     ESP.deepSleep(5 * 60e6); // 5 minutes 
   }
@@ -92,14 +101,23 @@ void loop() {
 
 /* --------------- WATERING --------------- */
 boolean needsWatering() {
-  // trigger watering at 9 AM
-  if ((hourNow() == 9 && hourSinceLastWatering > 10) || triggeredManually()) {
+  // trigger watering at 18:00
+  if ((hourNow() == 18 && hoursSinceLastWatering() > 10) || triggeredManually()) {
+    if ((hourNow() == 18 && hoursSinceLastWatering() > 10)) {
+      WebSerial.println("Watering triggered by time");
+    }
+    else if (triggeredManually()) {
+      WebSerial.println("Watering triggered manually");
+    }    
     triggerManuallyWateringFlag = false;
-    hourSinceLastWatering = hourNow();
     return true;
   } else {
     return false;
   }
+}
+
+int hoursSinceLastWatering() {
+  return abs(hourNow() -  hourOfTheLastWatering);
 }
 
 boolean triggeredManually() {
@@ -113,6 +131,8 @@ void waterPlants() {
     // TODO cancel watering?
     yield();
   }
+  hourOfTheLastWatering = hourNow();
+  timeOfTheLastWatering = timeNow();
   stopPump();
 }
 
@@ -132,15 +152,23 @@ void stopPump() {
 /* --------------- SENSORS --------------- */
 void measureSensorValues() {
   temperature = dht.readTemperature();
+  delay(100);
   humidity = dht.readHumidity();
-  /* TODO
-  moistureValue = analogRead(A0);
-  WebSerial.print("Moisture: ");
-  WebSerial.println(analogRead(MOISTURE_PIN));
-  moisturePercent = map(moistureValue, moistureAirValue, moistureWaterValue, 0, 100);
-  */
-  delay(5);
+  delay(100);
   measureBatteryVoltage();
+  delay(5);
+  measureMoistureSensors();
+}
+
+void measureMoistureSensors() {
+  // sensor voltage reduced from 5v to 3.3v using voltage divider (30k Ohm and 15k Ohm)
+  int16_t adcValueSoilMoisture = ads.readADC_SingleEnded(3);
+  delay(5);
+  int16_t adcValueWaterLevel = ads.readADC_SingleEnded(2);
+  delay(5);
+
+  soilMoisturePercent = map(adcValueSoilMoisture, moistureAirValue, moistureWaterValue, 0, 100);
+  waterLevelMoisturePercent = map(adcValueWaterLevel, moistureAirValue, moistureWaterValue, 0, 100);
 }
 
 void measureBatteryVoltage() {
@@ -168,7 +196,7 @@ RPC_Callback callbacks[callbacks_size] = {
 /* --------------- MISC --------------- */
 
 boolean lowBattery() {
-  return batteryVoltage < 3.2;
+  return batteryVoltage < 3.4;
 }
 
 void initWiFi() {
@@ -208,20 +236,34 @@ void reconnect() {
 
 void sendTelemetry() {
   WebSerial.println(timeNow());
+  delay(200);
   WebSerial.print("Temp: ");
   WebSerial.print(temperature);
   WebSerial.print(" *C. Hum: ");
   WebSerial.print(humidity);
   WebSerial.print(" %. Batt: ");
   WebSerial.print(batteryVoltage);
-  WebSerial.println(" V.");
+  WebSerial.println(" V");
+  delay(200);
+  WebSerial.print("Soil moisture: ");
+  WebSerial.print(soilMoisturePercent);
+  WebSerial.print(" %, Water level: ");
+  WebSerial.print(waterLevelMoisturePercent);
+  WebSerial.println(" percent");
+  delay(200);
 
   tb.sendTelemetryFloat("temperature", temperature);
   tb.sendTelemetryFloat("humidity", humidity);
   tb.sendTelemetryFloat("batteryVoltage", batteryVoltage);
-  char timeCharBuf[50];
-  timeNow().toCharArray(timeCharBuf, 50);
-  tb.sendTelemetryString("requestTime", timeCharBuf);
+  tb.sendTelemetryInt("soilMoisturePercent", soilMoisturePercent);
+  tb.sendTelemetryInt("waterLevelMoisturePercent", waterLevelMoisturePercent);
+  char updateTimeCharBuf[50];
+  timeNow().toCharArray(updateTimeCharBuf, 50);
+  tb.sendTelemetryString("updateTime", updateTimeCharBuf);
+  char timeOfTheLastWateringCharBuf[50];
+  timeOfTheLastWatering.toCharArray(timeOfTheLastWateringCharBuf, 50);
+  tb.sendTelemetryString("timeOfTheLastWatering", timeOfTheLastWateringCharBuf);
+  delay(200);
   WebSerial.println("Telemetry sent.");
 }
 
@@ -251,5 +293,5 @@ String timeNow() {
 }
 
 boolean isNight() {
-  return hourNow() < 6 || hourNow() > 21;
+  return hourNow() < 8 || hourNow() > 20;
 }
