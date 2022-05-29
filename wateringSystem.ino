@@ -11,8 +11,19 @@
 #include <Wire.h>
 #include <ESP_Mail_Client.h>
 #include <Arduino.h>
+#include <EEPROM.h>
 
+#define WIFI_AP             
+#define WIFI_PASSWORD       
 
+#define TOKEN               
+#define DEVICE_NAME         
+
+#define SMTP_HOST           
+#define SMTP_PORT           
+#define AUTHOR_EMAIL        
+#define AUTHOR_PASSWORD     
+#define RECIPIENT_EMAIL     
 
 #define DHTTYPE             DHT22
 
@@ -22,7 +33,7 @@ const int PUMP_RELAY_PIN = 12;
 const int DHT_PIN = 14;
 const int SCL_PIN = 5;
 const int SDA_PIN = 4;
-const int MOISTURE_PIN = A0;
+const int MOISTURE_TRANSISTOR_PIN = 13;
 
 /* The SMTP Session object used for Email sending */
 SMTPSession smtp;
@@ -45,17 +56,19 @@ WiFiClient wifiClient;
 ThingsBoard tb(wifiClient);
 
 // Watering variables
-// TODO change to 60s
-const long WATERING_TIME_IN_MS = 1000 * 30;
+const int EEPROM_WATERING_TIME_ADDRESS = 1;
+long wateringTimeInSeconds = 0;
 boolean triggerManuallyWateringFlag = false;
+boolean triggerAutomaticallyWateringFlag = false;
 
 // WIFI Serial
 AsyncWebServer serialServer(80);
 
 // Sensors
-const int moistureAirValue = 6900;
+const int moistureAirValue = 6700;
 const int moistureWaterValue = 4800;
-int soilMoisturePercent = 0;
+int soilMoisturePercent1 = 0;
+int soilMoisturePercent2 = 0;
 int waterLevelMoisturePercent = 0;
 float temperature = 0;
 float humidity = 0;
@@ -68,8 +81,12 @@ void setup() {
   Serial.begin(115200);
   dht.begin();
   ads.begin();
+  pinMode(MOISTURE_TRANSISTOR_PIN, OUTPUT);
   pinMode(PUMP_RELAY_PIN, OUTPUT);
+  digitalWrite(MOISTURE_TRANSISTOR_PIN, LOW); // turn off power for moisture sensors
   digitalWrite(PUMP_RELAY_PIN, HIGH); // stop pump manually without using stopPump(), because we use there WebSerial with WIFI
+
+  readFromEeprom();
   
   delay(10);
   WebSerial.begin(&serialServer);
@@ -89,7 +106,7 @@ void loop() {
   measureSensorValues();
   sendTelemetry();
 
-  if (needsWatering() && !lowWaterLevel()) {
+  if (triggerAutomaticallyWateringFlag && needsWatering() && !lowWaterLevel()) {
     waterPlants();
     mailSent = false;
   }
@@ -99,9 +116,7 @@ void loop() {
     mailSent = true;
   }
   delay(500);
-  if (false) {
-    // TODO
-  //if (isNight() || lowBattery()) {
+  if (isNight() || lowBattery()) {
     WebSerial.println("Going deep sleep");
     tb.sendTelemetryBool("deepSleep", true);
     delay(500);
@@ -141,7 +156,7 @@ boolean triggeredManually() {
 void waterPlants() {
   long startWateringTime = millis();
   startPump();
-  while (millis() - startWateringTime < WATERING_TIME_IN_MS) {
+  while (millis() - startWateringTime < wateringTimeInSeconds * 1000) {
     // TODO cancel watering?
     yield();
   }
@@ -175,13 +190,21 @@ void measureSensorValues() {
 }
 
 void measureMoistureSensors() {
-  // sensor voltage reduced from 5v to 3.3v using voltage divider (30k Ohm and 15k Ohm)
-  int16_t adcValueSoilMoisture = ads.readADC_SingleEnded(3);
+  // turn on power for moisture sensors
+  digitalWrite(MOISTURE_TRANSISTOR_PIN, HIGH);
+  delay(100);
+  // sensor voltage reduced from 5v to 3.3v using voltage divider (15k Ohm and 7,5k Ohm)
+  int16_t adcValueSoilMoisture1 = ads.readADC_SingleEnded(3);
   delay(5);
-  int16_t adcValueWaterLevel = ads.readADC_SingleEnded(2);
+  int16_t adcValueSoilMoisture2 = ads.readADC_SingleEnded(2);
   delay(5);
+  int16_t adcValueWaterLevel = ads.readADC_SingleEnded(1);
+  delay(10);
+  // turn off power for moisture sensors
+  digitalWrite(MOISTURE_TRANSISTOR_PIN, LOW);
 
-  soilMoisturePercent = map(adcValueSoilMoisture, moistureAirValue, moistureWaterValue, 0, 100);
+  soilMoisturePercent1 = map(adcValueSoilMoisture1, moistureAirValue-100, moistureWaterValue, 0, 100);
+  soilMoisturePercent2 = map(adcValueSoilMoisture2, moistureAirValue-200, moistureWaterValue-200, 0, 100);
   waterLevelMoisturePercent = map(adcValueWaterLevel, moistureAirValue, moistureWaterValue, 0, 100);
 }
 
@@ -196,18 +219,47 @@ void measureBatteryVoltage() {
 
 /* --------------- MQQT --------------- */
 
-RPC_Response wateringButtonTriggered(const RPC_Data &data) {
-  WebSerial.println("Received watering trigger from server");
+RPC_Response manuallywateringButtonTriggered(const RPC_Data &data) {
+  WebSerial.println("Received manually watering trigger from server");
   triggerManuallyWateringFlag = true;
   return RPC_Response(NULL, triggerManuallyWateringFlag);
 }
 
-const size_t callbacks_size = 1;
+RPC_Response autoWateringButtonTriggered(const RPC_Data &data) {
+  WebSerial.println("Received automatically watering trigger from server");
+  triggerAutomaticallyWateringFlag = !triggerAutomaticallyWateringFlag;
+  return RPC_Response(NULL, triggerAutomaticallyWateringFlag);
+}
+
+RPC_Response setWateringTimeInSeconds(const RPC_Data &data) {
+  int wateringTimeInSecondsFromRequest = data;
+  WebSerial.print("Received watering time: ");
+  WebSerial.println(wateringTimeInSecondsFromRequest);
+  wateringTimeInSeconds = wateringTimeInSecondsFromRequest;
+  EEPROM.put(EEPROM_WATERING_TIME_ADDRESS, wateringTimeInSeconds);
+  EEPROM.commit();
+  delay(5);
+  return RPC_Response(NULL, wateringTimeInSecondsFromRequest);
+}
+
+const size_t callbacks_size = 3;
 RPC_Callback callbacks[callbacks_size] = {
-  { "watering_switch", wateringButtonTriggered }
+  { "manuallywateringButtonTriggered", manuallywateringButtonTriggered },
+  { "autoWateringButtonTriggered", autoWateringButtonTriggered },
+  { "setWateringTimeInSeconds", setWateringTimeInSeconds }
 };
 
 /* --------------- MISC --------------- */
+
+void readFromEeprom() {
+  EEPROM.begin(10);
+  // Locations that have never been written to have the value of 255.
+  int wateringTimeReadFromEeprom;
+  EEPROM.get(EEPROM_WATERING_TIME_ADDRESS, wateringTimeReadFromEeprom);
+  if (wateringTimeReadFromEeprom != 255) {
+    wateringTimeInSeconds = wateringTimeReadFromEeprom;
+  }
+}
 
 void sendMail() {
   /* Set the callback function to get the sending results */
@@ -279,11 +331,12 @@ void smtpCallback(SMTP_Status status) {
 }
 
 boolean lowBattery() {
-  return batteryVoltage < 3.4;
+  // 3.9 for LiPo, 3.4 for LiIon
+  return batteryVoltage < 3.9;
 }
 
 boolean lowWaterLevel() {
-  return waterLevelMoisturePercent < 10;
+  return waterLevelMoisturePercent < 20;
 }
 
 void initWiFi() {
@@ -332,8 +385,10 @@ void sendTelemetry() {
   WebSerial.print(batteryVoltage);
   WebSerial.println(" V");
   delay(200);
-  WebSerial.print("Soil moisture: ");
-  WebSerial.print(soilMoisturePercent);
+  WebSerial.print("Soil moisture1: ");
+  WebSerial.print(soilMoisturePercent1);
+  WebSerial.print(" %, Soil moisture2: ");
+  WebSerial.print(soilMoisturePercent2);
   WebSerial.print(" %, Water level: ");
   WebSerial.print(waterLevelMoisturePercent);
   WebSerial.println(" percent");
@@ -342,8 +397,11 @@ void sendTelemetry() {
   tb.sendTelemetryFloat("temperature", temperature);
   tb.sendTelemetryFloat("humidity", humidity);
   tb.sendTelemetryFloat("batteryVoltage", batteryVoltage);
-  tb.sendTelemetryInt("soilMoisturePercent", soilMoisturePercent);
+  tb.sendTelemetryInt("soilMoisturePercent1", soilMoisturePercent1);
+  tb.sendTelemetryInt("soilMoisturePercent2", soilMoisturePercent2);
   tb.sendTelemetryInt("waterLevelMoisturePercent", waterLevelMoisturePercent);
+  tb.sendTelemetryInt("wateringTimeInSeconds", wateringTimeInSeconds);
+  tb.sendTelemetryBool("triggerAutomaticallyWateringFlag", triggerAutomaticallyWateringFlag);
   char updateTimeCharBuf[50];
   timeNow().toCharArray(updateTimeCharBuf, 50);
   tb.sendTelemetryString("updateTime", updateTimeCharBuf);
