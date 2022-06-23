@@ -13,17 +13,17 @@
 #include <Arduino.h>
 #include <EEPROM.h>
 
-#define WIFI_AP             
-#define WIFI_PASSWORD       
+#define WIFI_AP        
+#define WIFI_PASSWORD  
 
-#define TOKEN               
-#define DEVICE_NAME         
+#define TOKEN          
+#define DEVICE_NAME    
 
-#define SMTP_HOST           
-#define SMTP_PORT           
-#define AUTHOR_EMAIL        
-#define AUTHOR_PASSWORD     
-#define RECIPIENT_EMAIL     
+#define SMTP_HOST      
+#define SMTP_PORT      
+#define AUTHOR_EMAIL   
+#define AUTHOR_PASSWORD
+#define RECIPIENT_EMAIL
 
 #define DHTTYPE             DHT22
 
@@ -39,7 +39,7 @@ const int MOISTURE_TRANSISTOR_PIN = 13;
 SMTPSession smtp;
 /* Callback function to get the Email sending status */
 void smtpCallback(SMTP_Status status);
-boolean mailSent = false;
+bool mailSent = false;
 
 // Time variables
 WiFiUDP ntpUDP;
@@ -47,7 +47,9 @@ const long utcOffsetInSeconds = 7200;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffsetInSeconds);
 int lastSyncHour = 0;
 int hourOfTheLastWatering = 0;
+int minuteOfSystemStart = 0;
 String timeOfTheLastWatering = "";
+bool systemStartTimeSent = false; 
 
 // Thingsboard
 char thingsboardServer[] = "107.173.15.229";
@@ -57,9 +59,12 @@ ThingsBoard tb(wifiClient);
 
 // Watering variables
 const int EEPROM_WATERING_TIME_ADDRESS = 1;
+const int EEPROM_AUTO_WATERING_FLAG_ADDRESS = 20;
+const int EEPROM_HOUR_OF_THE_LAST_WATERING_ADDRESS = 40;
+const int EEPROM_TIME_OF_THE_LAST_WATERING_ADDRESS = 60;
 long wateringTimeInSeconds = 0;
-boolean triggerManuallyWateringFlag = false;
-boolean triggerAutomaticallyWateringFlag = false;
+bool triggerManuallyWateringFlag = false;
+bool triggerAutomaticallyWateringFlag = false;
 
 // WIFI Serial
 AsyncWebServer serialServer(80);
@@ -75,6 +80,7 @@ float humidity = 0;
 float current = 0;
 float batteryVoltage = 0;
 
+// Misc
 DHT dht(DHT_PIN, DHTTYPE);
 
 void setup() {
@@ -94,6 +100,7 @@ void setup() {
   delay(100);
   reconnect();
   timeClient.update();
+  minuteOfSystemStart = timeClient.getMinutes();
 }
 
 void loop() {
@@ -111,33 +118,28 @@ void loop() {
     mailSent = false;
   }
 
-  if (lowWaterLevel() && mailSent == false) {
+  if (lowWaterLevel() && mailSent == false && timeToSendMail()) {
     sendMail();
     mailSent = true;
   }
   delay(500);
-  if (isNight() || lowBattery()) {
+  
+  if (isNight() || lowBattery() || moreThanFiveMinutesFromSystemStart()) {
     WebSerial.println("Going deep sleep");
     tb.sendTelemetryBool("deepSleep", true);
     delay(500);
     ESP.deepSleep(5 * 60e6); // 5 minutes 
   }
   else {
-    tb.sendTelemetryBool("deepSlep", false);
-    delay(5000);
+    tb.sendTelemetryBool("deepSleep", false);
+    delay(10 * 1000); // 10 seconds
   }
 }
 
 /* --------------- WATERING --------------- */
-boolean needsWatering() {
-  // trigger watering at 18:00
-  if ((hourNow() == 18 && hoursSinceLastWatering() > 10) || triggeredManually()) {
-    if ((hourNow() == 18 && hoursSinceLastWatering() > 10)) {
-      WebSerial.println("Watering triggered by time");
-    }
-    else if (triggeredManually()) {
-      WebSerial.println("Watering triggered manually");
-    }    
+bool needsWatering() {
+  // trigger watering at 17:00 and 18:00
+  if (((hourNow() == 18 || hourNow() == 17) && hoursSinceLastWatering() > 0) || triggeredManually()) {
     triggerManuallyWateringFlag = false;
     return true;
   } else {
@@ -149,20 +151,34 @@ int hoursSinceLastWatering() {
   return abs(hourNow() -  hourOfTheLastWatering);
 }
 
-boolean triggeredManually() {
+bool moreThanFiveMinutesFromSystemStart() {
+  return abs(timeClient.getMinutes() - minuteOfSystemStart) > 4;
+}
+
+bool triggeredManually() {
   return triggerManuallyWateringFlag;
 }
 
 void waterPlants() {
+  if (triggeredManually()) {
+    WebSerial.println("Watering triggered manually");
+  } else {
+    WebSerial.println("Watering triggered by time");
+  } 
   long startWateringTime = millis();
   startPump();
   while (millis() - startWateringTime < wateringTimeInSeconds * 1000) {
     // TODO cancel watering?
     yield();
   }
+
+  stopPump();
+
   hourOfTheLastWatering = hourNow();
   timeOfTheLastWatering = timeNow();
-  stopPump();
+  EEPROM.put(EEPROM_HOUR_OF_THE_LAST_WATERING_ADDRESS, hourOfTheLastWatering);
+  EEPROM.put(EEPROM_TIME_OF_THE_LAST_WATERING_ADDRESS, timeOfTheLastWatering);
+  EEPROM.commit();
 }
 
 void startPump() {
@@ -199,7 +215,6 @@ void measureMoistureSensors() {
   int16_t adcValueSoilMoisture2 = ads.readADC_SingleEnded(2);
   delay(5);
   int16_t adcValueWaterLevel = ads.readADC_SingleEnded(1);
-  delay(10);
   // turn off power for moisture sensors
   digitalWrite(MOISTURE_TRANSISTOR_PIN, LOW);
 
@@ -227,7 +242,20 @@ RPC_Response manuallywateringButtonTriggered(const RPC_Data &data) {
 
 RPC_Response autoWateringButtonTriggered(const RPC_Data &data) {
   WebSerial.println("Received automatically watering trigger from server");
+  WebSerial.print("Current autoWatering flag: ");
+  WebSerial.print(triggerAutomaticallyWateringFlag);
   triggerAutomaticallyWateringFlag = !triggerAutomaticallyWateringFlag;
+  WebSerial.print(", new autoWatering flag: ");
+  WebSerial.println(triggerAutomaticallyWateringFlag);
+  int eepromAutoWatering;
+  if (triggerAutomaticallyWateringFlag) {
+    eepromAutoWatering = 1;
+  } else {
+    eepromAutoWatering = 0;
+  }
+  EEPROM.put(EEPROM_AUTO_WATERING_FLAG_ADDRESS, eepromAutoWatering);
+  EEPROM.commit();
+  delay(5);
   return RPC_Response(NULL, triggerAutomaticallyWateringFlag);
 }
 
@@ -240,6 +268,7 @@ RPC_Response setWateringTimeInSeconds(const RPC_Data &data) {
   EEPROM.commit();
   delay(5);
   return RPC_Response(NULL, wateringTimeInSecondsFromRequest);
+  delay(5);
 }
 
 const size_t callbacks_size = 3;
@@ -252,13 +281,26 @@ RPC_Callback callbacks[callbacks_size] = {
 /* --------------- MISC --------------- */
 
 void readFromEeprom() {
-  EEPROM.begin(10);
+  EEPROM.begin(200);
   // Locations that have never been written to have the value of 255.
   int wateringTimeReadFromEeprom;
   EEPROM.get(EEPROM_WATERING_TIME_ADDRESS, wateringTimeReadFromEeprom);
   if (wateringTimeReadFromEeprom != 255) {
     wateringTimeInSeconds = wateringTimeReadFromEeprom;
   }
+
+  int autoWatering;
+  EEPROM.get(EEPROM_AUTO_WATERING_FLAG_ADDRESS, autoWatering);
+  if (autoWatering != 255) {
+    if (autoWatering == 0) {
+      triggerAutomaticallyWateringFlag = false;
+    } else if (autoWatering == 1) {
+      triggerAutomaticallyWateringFlag = true;
+    }
+  }
+
+  EEPROM.get(EEPROM_HOUR_OF_THE_LAST_WATERING_ADDRESS, hourOfTheLastWatering);
+  EEPROM.get(EEPROM_TIME_OF_THE_LAST_WATERING_ADDRESS, timeOfTheLastWatering);
 }
 
 void sendMail() {
@@ -330,12 +372,12 @@ void smtpCallback(SMTP_Status status) {
   }
 }
 
-boolean lowBattery() {
+bool lowBattery() {
   // 3.9 for LiPo, 3.4 for LiIon
   return batteryVoltage < 3.9;
 }
 
-boolean lowWaterLevel() {
+bool lowWaterLevel() {
   return waterLevelMoisturePercent < 20;
 }
 
@@ -356,18 +398,18 @@ void reconnect() {
     if (WiFi.status() != WL_CONNECTED) {
       initWiFi();
     }
-    WebSerial.print("Connecting to ThingsBoard node ...");
+    Serial.print("Connecting to ThingsBoard node ...");
     if (tb.connect(thingsboardServer, TOKEN) ) {
-      WebSerial.println( "[DONE]" );
-      WebSerial.println("Subscribing for RPC...");
+      Serial.println( "[DONE]" );
+      Serial.println("Subscribing for RPC...");
 
       // Perform a subscription
       if (!tb.RPC_Subscribe(callbacks, callbacks_size)) {
-        WebSerial.println("Failed to subscribe for RPC");
+        Serial.println("Failed to subscribe for RPC");
       }
     } else {
-      WebSerial.print( "[FAILED]" );
-      WebSerial.println( ": retrying in 5 seconds]" );
+      Serial.print( "[FAILED]" );
+      Serial.println( ": retrying in 5 seconds]" );
       // Wait 5 seconds before retrying
       delay(5000);
     }
@@ -377,6 +419,7 @@ void reconnect() {
 void sendTelemetry() {
   WebSerial.println(timeNow());
   delay(200);
+  /* For debugging
   WebSerial.print("Temp: ");
   WebSerial.print(temperature);
   WebSerial.print(" *C. Hum: ");
@@ -393,6 +436,14 @@ void sendTelemetry() {
   WebSerial.print(waterLevelMoisturePercent);
   WebSerial.println(" percent");
   delay(200);
+  */
+
+  if (!systemStartTimeSent) {
+    char systemStartTimeCharBuf[50];
+    timeNow().toCharArray(systemStartTimeCharBuf, 50);
+    tb.sendTelemetryString("systemStartTime", systemStartTimeCharBuf);
+    systemStartTimeSent = true;
+  }
 
   tb.sendTelemetryFloat("temperature", temperature);
   tb.sendTelemetryFloat("humidity", humidity);
@@ -437,6 +488,10 @@ String timeNow() {
   return timeClient.getFormattedTime();
 }
 
-boolean isNight() {
-  return hourNow() < 8 || hourNow() > 20;
+bool isNight() {
+  return hourNow() < 8 || hourNow() > 19;
+}
+
+bool timeToSendMail() {
+  return hourNow() == 14 && timeClient.getMinutes() > 0 && timeClient.getMinutes() < 10;
 }
