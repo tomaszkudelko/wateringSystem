@@ -1,39 +1,36 @@
 #include <NTPClient.h>
-#include <ESP8266WiFi.h>
+#include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ThingsBoard.h>
 #include <ArduinoJson.h>
 #include <DHT.h> 
-#include <ESPAsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#include <WebSerial.h>
 #include <Adafruit_ADS1X15.h>
 #include <Wire.h>
 #include <ESP_Mail_Client.h>
 #include <Arduino.h>
 #include <EEPROM.h>
+// display
+#include <SPI.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
 
-#define WIFI_AP        
-#define WIFI_PASSWORD  
 
-#define TOKEN          
-#define DEVICE_NAME    
-
-#define SMTP_HOST      
-#define SMTP_PORT      
-#define AUTHOR_EMAIL   
-#define AUTHOR_PASSWORD
-#define RECIPIENT_EMAIL
 
 #define DHTTYPE             DHT22
 
+#define OLED_WIDTH          128
+#define OLED_HEIGHT         64
+#define OLED_RESET          -1
+#define SCREEN_ADDRESS      0x3C
+
+Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
+char displayArray[21][8];
+
 // PINOUTs
-Adafruit_ADS1115 ads;	
-const int PUMP_RELAY_PIN = 12;
-const int DHT_PIN = 14;
-const int SCL_PIN = 5;
-const int SDA_PIN = 4;
-const int MOISTURE_TRANSISTOR_PIN = 13;
+const int PUMP_RELAY_PIN = 14;
+const int DHT_PIN = 23;
+const int SENSOR_TRANSISTOR_PIN = 27;
+const int BATT_V_PIN = 35;
 
 /* The SMTP Session object used for Email sending */
 SMTPSession smtp;
@@ -52,7 +49,7 @@ String timeOfTheLastWatering = "";
 bool systemStartTimeSent = false; 
 
 // Thingsboard
-char thingsboardServer[] = "107.173.15.229";
+char thingsboardServer[] = "107.175.142.252";
 // int thingsboardPort = 1883; was used for PubSubClient
 WiFiClient wifiClient;
 ThingsBoard tb(wifiClient);
@@ -66,12 +63,9 @@ long wateringTimeInSeconds = 0;
 bool triggerManuallyWateringFlag = false;
 bool triggerAutomaticallyWateringFlag = false;
 
-// WIFI Serial
-AsyncWebServer serialServer(80);
-
 // Sensors
-const int moistureAirValue = 6700;
-const int moistureWaterValue = 4800;
+const int moistureAirValue = 4200;
+const int moistureWaterValue = 3750;
 int soilMoisturePercent1 = 0;
 int soilMoisturePercent2 = 0;
 int waterLevelMoisturePercent = 0;
@@ -86,17 +80,21 @@ DHT dht(DHT_PIN, DHTTYPE);
 void setup() {
   Serial.begin(115200);
   dht.begin();
-  ads.begin();
-  pinMode(MOISTURE_TRANSISTOR_PIN, OUTPUT);
-  pinMode(PUMP_RELAY_PIN, OUTPUT);
-  digitalWrite(MOISTURE_TRANSISTOR_PIN, LOW); // turn off power for moisture sensors
-  digitalWrite(PUMP_RELAY_PIN, HIGH); // stop pump manually without using stopPump(), because we use there WebSerial with WIFI
-
-  readFromEeprom();
+  display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+  display.display();
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
   
-  delay(10);
-  WebSerial.begin(&serialServer);
-  serialServer.begin();
+  pinMode(BATT_V_PIN, INPUT);
+  pinMode(SENSOR_TRANSISTOR_PIN, OUTPUT);
+  // TODO
+  // pinMode(PUMP_RELAY_PIN, OUTPUT);
+  digitalWrite(SENSOR_TRANSISTOR_PIN, LOW); // turn off power for moisture sensors
+  // digitalWrite(PUMP_RELAY_PIN, HIGH); // stop pump manually without using stopPump(), because we use there WebSerial with WIFI
+
+  // readFromEeprom();
+  
   delay(100);
   reconnect();
   timeClient.update();
@@ -113,33 +111,44 @@ void loop() {
   measureSensorValues();
   sendTelemetry();
 
-  if (triggerAutomaticallyWateringFlag && needsWatering() && !lowWaterLevel()) {
+  if ((triggerAutomaticallyWateringFlag && needsWatering() && !lowWaterLevel()) || triggeredManually()) {
     waterPlants();
     mailSent = false;
   }
 
-  if (lowWaterLevel() && mailSent == false && timeToSendMail()) {
-    sendMail();
-    mailSent = true;
-  }
-  delay(500);
+  // TODO
+  // if (lowWaterLevel() && mailSent == false && timeToSendMail()) {
+  //   sendMail();
+  //   mailSent = true;
+  // }
+  // delay(500);
   
-  if (isNight() || lowBattery() || moreThanFiveMinutesFromSystemStart()) {
-    WebSerial.println("Going deep sleep");
-    tb.sendTelemetryBool("deepSleep", true);
-    delay(500);
-    ESP.deepSleep(5 * 60e6); // 5 minutes 
-  }
-  else {
-    tb.sendTelemetryBool("deepSleep", false);
-    delay(10 * 1000); // 10 seconds
-  }
+  // if (isNight() || lowBattery()) {
+  //   logPrintln("Going deep sleep");
+  //   logDisplay();
+  //   tb.sendTelemetryBool("deepSleep", true);
+  //   delay(500);
+  //   ESP.deepSleep(5 * 60e6); // 5 minutes 
+  // }
+  // else if (moreThanFiveMinutesFromSystemStart()) {
+  //   logPrintln("Restarting");
+  //   logDisplay();
+  //   tb.sendTelemetryBool("deepSleep", true);
+  //   delay(500);
+  //   ESP.deepSleep(1e6); // 1 second 
+  // }
+  // else {
+  //   tb.sendTelemetryBool("deepSleep", false);
+  //   delay(10 * 1000); // 10 seconds
+  // }
+  // TODO remove delay
+  delay(3000);
 }
 
 /* --------------- WATERING --------------- */
 bool needsWatering() {
-  // trigger watering at 17:00 and 18:00
-  if (((hourNow() == 18 || hourNow() == 17) && hoursSinceLastWatering() > 0) || triggeredManually()) {
+  // trigger watering at 8:00 and 21:00
+  if (((hourNow() == 8 || hourNow() == 21) && hoursSinceLastWatering() > 0)) {
     triggerManuallyWateringFlag = false;
     return true;
   } else {
@@ -161,10 +170,11 @@ bool triggeredManually() {
 
 void waterPlants() {
   if (triggeredManually()) {
-    WebSerial.println("Watering triggered manually");
+    logPrintln("Watering triggered manually");
   } else {
-    WebSerial.println("Watering triggered by time");
+    logPrintln("Watering triggered by time");
   } 
+  logDisplay();
   long startWateringTime = millis();
   startPump();
   while (millis() - startWateringTime < wateringTimeInSeconds * 1000) {
@@ -182,20 +192,27 @@ void waterPlants() {
 }
 
 void startPump() {
-  WebSerial.print(timeNow());
-  WebSerial.println(": starting pump...");
+  logPrint(timeNow());
+  logPrintln(": starting pump...");
+  logDisplay();
   digitalWrite(PUMP_RELAY_PIN, LOW);
 }
 
 void stopPump() {
-  WebSerial.print(timeNow());
-  WebSerial.println(": stopping pump...");
+  logPrint(timeNow());
+  logPrintln(": stopping pump...");
+  logDisplay();
   digitalWrite(PUMP_RELAY_PIN, HIGH);  
 }
 
 
 /* --------------- SENSORS --------------- */
 void measureSensorValues() {
+  // turn on power for moisture sensors
+  digitalWrite(SENSOR_TRANSISTOR_PIN, HIGH);
+  delay(500);
+  dht.begin();
+  delay(500);
   temperature = dht.readTemperature();
   delay(100);
   humidity = dht.readHumidity();
@@ -203,50 +220,56 @@ void measureSensorValues() {
   measureBatteryVoltage();
   delay(5);
   measureMoistureSensors();
+  // turn off power for moisture sensors
+  digitalWrite(SENSOR_TRANSISTOR_PIN, LOW);
 }
 
 void measureMoistureSensors() {
-  // turn on power for moisture sensors
-  digitalWrite(MOISTURE_TRANSISTOR_PIN, HIGH);
-  delay(100);
   // sensor voltage reduced from 5v to 3.3v using voltage divider (15k Ohm and 7,5k Ohm)
+  /* TODO get rid of "ads":
   int16_t adcValueSoilMoisture1 = ads.readADC_SingleEnded(3);
   delay(5);
   int16_t adcValueSoilMoisture2 = ads.readADC_SingleEnded(2);
   delay(5);
   int16_t adcValueWaterLevel = ads.readADC_SingleEnded(1);
-  // turn off power for moisture sensors
-  digitalWrite(MOISTURE_TRANSISTOR_PIN, LOW);
 
-  soilMoisturePercent1 = map(adcValueSoilMoisture1, moistureAirValue-100, moistureWaterValue, 0, 100);
-  soilMoisturePercent2 = map(adcValueSoilMoisture2, moistureAirValue-200, moistureWaterValue-200, 0, 100);
-  waterLevelMoisturePercent = map(adcValueWaterLevel, moistureAirValue, moistureWaterValue, 0, 100);
+  // logPrintln(adcValueSoilMoisture1);
+  // logPrintln(adcValueSoilMoisture2);
+  // logPrintln(adcValueWaterLevel);
+  // logDisplay();
+
+  soilMoisturePercent1 = map(adcValueSoilMoisture1, moistureAirValue, moistureWaterValue, 0, 100);
+  soilMoisturePercent2 = map(adcValueSoilMoisture2, moistureAirValue, moistureWaterValue, 0, 100);
+  waterLevelMoisturePercent = map(adcValueWaterLevel, moistureAirValue+100, moistureWaterValue+130, 0, 100);
+  */
 }
 
 void measureBatteryVoltage() {
-  float calibration = -0.13;
-  float refVoltage = 4.8;
-  int adcValue = analogRead(A0);
+  float calibration = 0.8; //-0.13;
+  float refVoltage = 20.566;
+  int adcValue = analogRead(BATT_V_PIN);
   delay(5);
-  float adcVoltage  = (adcValue * refVoltage) / 1024.0; 
+  float adcVoltage  = refVoltage * (adcValue / 4096.0); 
   batteryVoltage = adcVoltage + calibration;
 }
 
 /* --------------- MQQT --------------- */
 
 RPC_Response manuallywateringButtonTriggered(const RPC_Data &data) {
-  WebSerial.println("Received manually watering trigger from server");
+  logPrintln("Received manually watering trigger from server");
+  logDisplay();
   triggerManuallyWateringFlag = true;
   return RPC_Response(NULL, triggerManuallyWateringFlag);
 }
 
 RPC_Response autoWateringButtonTriggered(const RPC_Data &data) {
-  WebSerial.println("Received automatically watering trigger from server");
-  WebSerial.print("Current autoWatering flag: ");
-  WebSerial.print(triggerAutomaticallyWateringFlag);
+  logPrintln("Received automatically watering trigger from server");
+  logPrint("Current autoWatering flag: ");
+  logPrint(triggerAutomaticallyWateringFlag);
   triggerAutomaticallyWateringFlag = !triggerAutomaticallyWateringFlag;
-  WebSerial.print(", new autoWatering flag: ");
-  WebSerial.println(triggerAutomaticallyWateringFlag);
+  logPrint(", new autoWatering flag: ");
+  logPrintln(triggerAutomaticallyWateringFlag);
+  logDisplay();
   int eepromAutoWatering;
   if (triggerAutomaticallyWateringFlag) {
     eepromAutoWatering = 1;
@@ -261,8 +284,9 @@ RPC_Response autoWateringButtonTriggered(const RPC_Data &data) {
 
 RPC_Response setWateringTimeInSeconds(const RPC_Data &data) {
   int wateringTimeInSecondsFromRequest = data;
-  WebSerial.print("Received watering time: ");
-  WebSerial.println(wateringTimeInSecondsFromRequest);
+  logPrint("Received watering time: ");
+  logPrintln(wateringTimeInSecondsFromRequest);
+  logDisplay();
   wateringTimeInSeconds = wateringTimeInSecondsFromRequest;
   EEPROM.put(EEPROM_WATERING_TIME_ADDRESS, wateringTimeInSeconds);
   EEPROM.commit();
@@ -279,6 +303,61 @@ RPC_Callback callbacks[callbacks_size] = {
 };
 
 /* --------------- MISC --------------- */
+void logPrint(const char str[]) {
+  display.print(str);
+  Serial.print(str);
+}
+
+void logPrintln(const char str[]) {
+  display.println(str);
+  Serial.println(str);
+}
+
+void logPrint(String str) {
+  display.print(str);
+  Serial.print(str);
+}
+
+void logPrintln(String str) {
+  display.println(str);
+  Serial.println(str);
+}
+
+void logPrint(bool str) {
+  display.print(str);
+  Serial.print(str);
+}
+
+void logPrintln(bool str) {
+  display.println(str);
+  Serial.println(str);
+}
+
+void logPrint(float str) {
+  display.print(str);
+  Serial.print(str);
+}
+
+void logPrintln(float str) {
+  display.println(str);
+  Serial.println(str);
+}
+
+void logPrint(int str) {
+  display.print(str);
+  Serial.print(str);
+}
+
+void logPrintln(int str) {
+  display.println(str);
+  Serial.println(str);
+}
+
+void logDisplay() {
+  display.display();
+  display.clearDisplay();
+  display.setCursor(0, 0);
+}
 
 void readFromEeprom() {
   EEPROM.begin(200);
@@ -341,21 +420,22 @@ void sendMail() {
 
   /* Start sending Email and close the session */
   if (!MailClient.sendMail(&smtp, &message)) {
-    WebSerial.println("Error sending Email, " + smtp.errorReason());
+    logPrintln("Error sending Email, " + smtp.errorReason());
+    logDisplay();
   }
 }
 
 /* Callback function to get the Email sending status */
 void smtpCallback(SMTP_Status status) {
   /* Print the current status */
-  Serial.println(status.info());
+  logPrintln(status.info());
 
   /* Print the sending result */
   if (status.success()){
-    Serial.println("----------------");
+    logPrintln("----------------");
     ESP_MAIL_PRINTF("Message sent success: %d\n", status.completedCount());
     ESP_MAIL_PRINTF("Message sent failled: %d\n", status.failedCount());
-    Serial.println("----------------\n");
+    logPrintln("----------------\n");
     struct tm dt;
 
     for (size_t i = 0; i < smtp.sendingResult.size(); i++){
@@ -368,7 +448,8 @@ void smtpCallback(SMTP_Status status) {
       ESP_MAIL_PRINTF("Status: %s\n", result.completed ? "success" : "failed");
       ESP_MAIL_PRINTF("Date/Time: %d/%d/%d %d:%d:%d\n", dt.tm_year + 1900, dt.tm_mon + 1, dt.tm_mday, dt.tm_hour, dt.tm_min, dt.tm_sec);
     }
-    Serial.println("----------------\n");
+    logPrintln("----------------\n");
+    logDisplay();
   }
 }
 
@@ -382,13 +463,14 @@ bool lowWaterLevel() {
 }
 
 void initWiFi() {
-  Serial.println("Connecting to AP ...");
+  logPrintln("Connecting to AP ...");
   WiFi.begin(WIFI_AP, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
-    Serial.print(".");
+    logPrint(".");
   }
-  Serial.println("Connected to AP");
+  logPrintln("Connected to AP");
+  logDisplay();
   delay(5000); // needed to initalize the WebSerial
 }
 
@@ -398,45 +480,47 @@ void reconnect() {
     if (WiFi.status() != WL_CONNECTED) {
       initWiFi();
     }
-    Serial.print("Connecting to ThingsBoard node ...");
+    logPrint("Connecting to ThingsBoard node ...");
     if (tb.connect(thingsboardServer, TOKEN) ) {
-      Serial.println( "[DONE]" );
-      Serial.println("Subscribing for RPC...");
+      logPrintln( "[DONE]" );
+      logPrintln("Subscribing for RPC...");
 
       // Perform a subscription
       if (!tb.RPC_Subscribe(callbacks, callbacks_size)) {
-        Serial.println("Failed to subscribe for RPC");
+        logPrintln("Failed to subscribe for RPC");
       }
     } else {
-      Serial.print( "[FAILED]" );
-      Serial.println( ": retrying in 5 seconds]" );
+      logPrint( "[FAILED]" );
+      logPrintln( ": retrying in 5 seconds]" );
       // Wait 5 seconds before retrying
       delay(5000);
     }
+    logDisplay();
   }
 }
 
 void sendTelemetry() {
-  WebSerial.println(timeNow());
+  logPrintln(timeDateNow());
   delay(200);
-  /* For debugging
-  WebSerial.print("Temp: ");
-  WebSerial.print(temperature);
-  WebSerial.print(" *C. Hum: ");
-  WebSerial.print(humidity);
-  WebSerial.print(" %. Batt: ");
-  WebSerial.print(batteryVoltage);
-  WebSerial.println(" V");
+  /* For debugging   */
+  logPrint("T: ");
+  logPrint(temperature);
+  logPrint("C Hum: ");
+  logPrint(humidity);
+  logPrintln("%");
+  logPrint("Batt: ");
+  logPrint(batteryVoltage);
+  logPrintln("V. ");
   delay(200);
-  WebSerial.print("Soil moisture1: ");
-  WebSerial.print(soilMoisturePercent1);
-  WebSerial.print(" %, Soil moisture2: ");
-  WebSerial.print(soilMoisturePercent2);
-  WebSerial.print(" %, Water level: ");
-  WebSerial.print(waterLevelMoisturePercent);
-  WebSerial.println(" percent");
+  logPrint("Soil1: ");
+  logPrint(soilMoisturePercent1);
+  logPrint("%, Soil2: ");
+  logPrint(soilMoisturePercent2);
+  logPrint("%, Water: ");
+  logPrint(waterLevelMoisturePercent);
+  logPrintln("%");
   delay(200);
-  */
+
 
   if (!systemStartTimeSent) {
     char systemStartTimeCharBuf[50];
@@ -460,7 +544,8 @@ void sendTelemetry() {
   timeOfTheLastWatering.toCharArray(timeOfTheLastWateringCharBuf, 50);
   tb.sendTelemetryString("timeOfTheLastWatering", timeOfTheLastWateringCharBuf);
   delay(200);
-  WebSerial.println("Telemetry sent.");
+  logPrintln("Telemetry sent.");
+  logDisplay();
 }
 
 /* --------------- TIME MANAGEMENT --------------- */
@@ -469,14 +554,15 @@ void synchroniseTime() {
   int hoursSinceLastSync = abs(timeClient.getHours() - lastSyncHour);
   /*
   Used to debug:
-  WebSerial.print("hours since last sync: ");
-  WebSerial.println(hoursSinceLastSync);
-  WebSerial.println(timeNow());
+  logPrint("hours since last sync: ");
+  logPrintln(hoursSinceLastSync);
+  logPrintln(timeNow());
     */
   if (hoursSinceLastSync > 10) {
-    WebSerial.println("Time synced");
+    logPrintln("Time synced");
     timeClient.update();
     lastSyncHour = timeClient.getHours();
+    logDisplay();
   }
 }
 
@@ -486,6 +572,16 @@ int hourNow() {
 
 String timeNow() {
   return timeClient.getFormattedTime();
+}
+
+String timeDateNow() {
+  time_t epochTime = timeClient.getEpochTime();
+  struct tm *ptm = gmtime ((time_t *)&epochTime); 
+
+  int currentMonthDay = ptm->tm_mday;
+  int currentMonth = ptm->tm_mon+1;
+  int currentYear = ptm->tm_year+1900;
+  return timeClient.getFormattedTime() + " " + currentMonthDay + "." + currentMonth + "." + currentYear;
 }
 
 bool isNight() {
