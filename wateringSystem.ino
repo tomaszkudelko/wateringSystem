@@ -8,7 +8,7 @@
 #include <Wire.h>
 #include <ESP_Mail_Client.h>
 #include <Arduino.h>
-#include <EEPROM.h>
+#include <Preferences.h>
 // display
 #include <SPI.h>
 #include <Adafruit_SSD1306.h>
@@ -27,10 +27,15 @@ Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
 char displayArray[21][8];
 
 // PINOUTs
-const int PUMP_RELAY_PIN = 14;
+const int PUMP_TRANSISTOR_PIN = 2;
+const int PUMP_FLOWERS_PIN = 12;
+const int PUMP_TOMATOS_PIN = 14;
 const int DHT_PIN = 23;
 const int SENSOR_TRANSISTOR_PIN = 27;
-const int BATT_V_PIN = 35;
+const int BATT_V_PIN = 36;
+const int SOIL_MOISTURE_PIN_1 = 35;
+const int SOIL_MOISTURE_PIN_2 = 39;
+const int RAIN_DROPS_PIN = 34;
 
 /* The SMTP Session object used for Email sending */
 SMTPSession smtp;
@@ -55,19 +60,25 @@ WiFiClient wifiClient;
 ThingsBoard tb(wifiClient);
 
 // Watering variables
-const int EEPROM_WATERING_TIME_ADDRESS = 1;
-const int EEPROM_AUTO_WATERING_FLAG_ADDRESS = 20;
-const int EEPROM_HOUR_OF_THE_LAST_WATERING_ADDRESS = 40;
-const int EEPROM_TIME_OF_THE_LAST_WATERING_ADDRESS = 60;
+Preferences preferences;
+const char EEPROM_WATERING_TIME_KEY[] = "WATERING_TIME";
+const char EEPROM_AUTO_WATERING_FLAG_KEY[] = "AUTO_WATERING";
+const char EEPROM_HOUR_OF_THE_LAST_WATERING_KEY[] = "HOUR_LAST_WAT";
+const char EEPROM_TIME_OF_THE_LAST_WATERING_KEY[] = "TIME_LAST_WAT";
 long wateringTimeInSeconds = 0;
 bool triggerManuallyWateringFlag = false;
 bool triggerAutomaticallyWateringFlag = false;
 
 // Sensors
 const int moistureAirValue = 4200;
-const int moistureWaterValue = 3750;
+const int moistureWaterValue = 0;
+// TODO check and adjust
+const int rainDropsAirValue = 4200;
+const int rainDropsWaterValue = 1500;
 int soilMoisturePercent1 = 0;
 int soilMoisturePercent2 = 0;
+int rainDropsPercent = 0;
+// TODO implement laser sensor
 int waterLevelMoisturePercent = 0;
 float temperature = 0;
 float humidity = 0;
@@ -87,13 +98,14 @@ void setup() {
   display.setTextColor(WHITE);
   
   pinMode(BATT_V_PIN, INPUT);
+  pinMode(PUMP_TRANSISTOR_PIN, OUTPUT);
   pinMode(SENSOR_TRANSISTOR_PIN, OUTPUT);
-  // TODO
-  // pinMode(PUMP_RELAY_PIN, OUTPUT);
+  pinMode(PUMP_FLOWERS_PIN, OUTPUT);
+  pinMode(PUMP_TOMATOS_PIN, OUTPUT);
   digitalWrite(SENSOR_TRANSISTOR_PIN, LOW); // turn off power for moisture sensors
   // digitalWrite(PUMP_RELAY_PIN, HIGH); // stop pump manually without using stopPump(), because we use there WebSerial with WIFI
 
-  // readFromEeprom();
+  readFromEeprom();
   
   delay(100);
   reconnect();
@@ -114,6 +126,7 @@ void loop() {
   if ((triggerAutomaticallyWateringFlag && needsWatering() && !lowWaterLevel()) || triggeredManually()) {
     waterPlants();
     mailSent = false;
+    triggerManuallyWateringFlag = false;
   }
 
   // TODO
@@ -141,15 +154,18 @@ void loop() {
   //   tb.sendTelemetryBool("deepSleep", false);
   //   delay(10 * 1000); // 10 seconds
   // }
-  // TODO remove delay
-  delay(3000);
+  // TODO remove
+  // logPrintln("Sleep");
+  // logDisplay();
+  // esp_sleep_enable_timer_wakeup(1e6 * 60 * 5);
+  // esp_deep_sleep_start();
+  delay(5000);
 }
 
 /* --------------- WATERING --------------- */
 bool needsWatering() {
   // trigger watering at 8:00 and 21:00
   if (((hourNow() == 8 || hourNow() == 21) && hoursSinceLastWatering() > 0)) {
-    triggerManuallyWateringFlag = false;
     return true;
   } else {
     return false;
@@ -175,34 +191,56 @@ void waterPlants() {
     logPrintln("Watering triggered by time");
   } 
   logDisplay();
+  
+  digitalWrite(PUMP_TRANSISTOR_PIN, HIGH);
+  delay(50);
+  waterWithPump(PUMP_FLOWERS_PIN);
+  waterWithPump(PUMP_TOMATOS_PIN);
+  digitalWrite(PUMP_TRANSISTOR_PIN, LOW);
+
+  hourOfTheLastWatering = hourNow();
+  timeOfTheLastWatering = timeDateNow();
+
+  preferences.begin("my−app", false);
+  preferences.putInt(EEPROM_HOUR_OF_THE_LAST_WATERING_KEY, hourOfTheLastWatering);
+  preferences.putString(EEPROM_TIME_OF_THE_LAST_WATERING_KEY, timeOfTheLastWatering);
+  preferences.end();
+  logPrintln("Time of last watering: ");
+  logPrintln(timeOfTheLastWatering);
+  logDisplay();
+}
+
+void waterWithPump(int pPumpPin)
+{
   long startWateringTime = millis();
-  startPump();
+  startPump(pPumpPin);
+  long lastDotTime = startWateringTime;
   while (millis() - startWateringTime < wateringTimeInSeconds * 1000) {
     // TODO cancel watering?
     yield();
+    if (millis() > lastDotTime + 1000)
+    {
+      logPrint(".");
+      lastDotTime = millis();
+    }
   }
-
-  stopPump();
-
-  hourOfTheLastWatering = hourNow();
-  timeOfTheLastWatering = timeNow();
-  EEPROM.put(EEPROM_HOUR_OF_THE_LAST_WATERING_ADDRESS, hourOfTheLastWatering);
-  EEPROM.put(EEPROM_TIME_OF_THE_LAST_WATERING_ADDRESS, timeOfTheLastWatering);
-  EEPROM.commit();
+  logDisplay();
+  stopPump(pPumpPin);
 }
 
-void startPump() {
-  logPrint(timeNow());
-  logPrintln(": starting pump...");
-  logDisplay();
-  digitalWrite(PUMP_RELAY_PIN, LOW);
+void startPump(int pPumpPin) {
+  logPrintln(timeNow());
+  logPrint("Starting pump: ");
+  logPrintln(pPumpPin);
+  digitalWrite(pPumpPin, HIGH);
 }
 
-void stopPump() {
-  logPrint(timeNow());
-  logPrintln(": stopping pump...");
+void stopPump(int pPumpPin) {
+  logPrintln(timeNow());
+  logPrint("Stopping pump: ");
+  logPrintln(pPumpPin);
   logDisplay();
-  digitalWrite(PUMP_RELAY_PIN, HIGH);  
+  digitalWrite(pPumpPin, LOW);  
 }
 
 
@@ -225,27 +263,29 @@ void measureSensorValues() {
 }
 
 void measureMoistureSensors() {
-  // sensor voltage reduced from 5v to 3.3v using voltage divider (15k Ohm and 7,5k Ohm)
-  /* TODO get rid of "ads":
-  int16_t adcValueSoilMoisture1 = ads.readADC_SingleEnded(3);
+  int16_t analogValueSoilMoisture1 = analogRead(SOIL_MOISTURE_PIN_1);
   delay(5);
-  int16_t adcValueSoilMoisture2 = ads.readADC_SingleEnded(2);
+  int16_t analogValueSoilMoisture2 = analogRead(SOIL_MOISTURE_PIN_2);
   delay(5);
-  int16_t adcValueWaterLevel = ads.readADC_SingleEnded(1);
+  int16_t analogValueRainDrops = analogRead(RAIN_DROPS_PIN );
 
   // logPrintln(adcValueSoilMoisture1);
   // logPrintln(adcValueSoilMoisture2);
   // logPrintln(adcValueWaterLevel);
   // logDisplay();
+  // Serial.print("soil: ");
+  // Serial.println(analogValueSoilMoisture1);
+  // Serial.print("rain: ");
+  // Serial.println(analogValueRainDrops);
 
-  soilMoisturePercent1 = map(adcValueSoilMoisture1, moistureAirValue, moistureWaterValue, 0, 100);
-  soilMoisturePercent2 = map(adcValueSoilMoisture2, moistureAirValue, moistureWaterValue, 0, 100);
-  waterLevelMoisturePercent = map(adcValueWaterLevel, moistureAirValue+100, moistureWaterValue+130, 0, 100);
-  */
+  soilMoisturePercent1 = map(analogValueSoilMoisture1, moistureAirValue, moistureWaterValue+200, 0, 100);
+  soilMoisturePercent2 = map(analogValueSoilMoisture2, moistureAirValue, moistureWaterValue, 0, 100);
+  rainDropsPercent = map(analogValueRainDrops, rainDropsAirValue, rainDropsWaterValue, 0, 100);
+  //waterLevelMoisturePercent = map(adcValueWaterLevel, moistureAirValue+100, moistureWaterValue+130, 0, 100);
 }
 
 void measureBatteryVoltage() {
-  float calibration = 0.8; //-0.13;
+  float calibration = 0.8;
   float refVoltage = 20.566;
   int adcValue = analogRead(BATT_V_PIN);
   delay(5);
@@ -270,14 +310,9 @@ RPC_Response autoWateringButtonTriggered(const RPC_Data &data) {
   logPrint(", new autoWatering flag: ");
   logPrintln(triggerAutomaticallyWateringFlag);
   logDisplay();
-  int eepromAutoWatering;
-  if (triggerAutomaticallyWateringFlag) {
-    eepromAutoWatering = 1;
-  } else {
-    eepromAutoWatering = 0;
-  }
-  EEPROM.put(EEPROM_AUTO_WATERING_FLAG_ADDRESS, eepromAutoWatering);
-  EEPROM.commit();
+  preferences.begin("my−app", false);
+  preferences.putBool(EEPROM_AUTO_WATERING_FLAG_KEY, triggerAutomaticallyWateringFlag);
+  preferences.end();
   delay(5);
   return RPC_Response(NULL, triggerAutomaticallyWateringFlag);
 }
@@ -288,8 +323,9 @@ RPC_Response setWateringTimeInSeconds(const RPC_Data &data) {
   logPrintln(wateringTimeInSecondsFromRequest);
   logDisplay();
   wateringTimeInSeconds = wateringTimeInSecondsFromRequest;
-  EEPROM.put(EEPROM_WATERING_TIME_ADDRESS, wateringTimeInSeconds);
-  EEPROM.commit();
+  preferences.begin("my−app", false);
+  preferences.putLong(EEPROM_WATERING_TIME_KEY, wateringTimeInSeconds);
+  preferences.end();
   delay(5);
   return RPC_Response(NULL, wateringTimeInSecondsFromRequest);
   delay(5);
@@ -305,51 +341,73 @@ RPC_Callback callbacks[callbacks_size] = {
 /* --------------- MISC --------------- */
 void logPrint(const char str[]) {
   display.print(str);
+  display.display();
   Serial.print(str);
 }
 
 void logPrintln(const char str[]) {
   display.println(str);
+  display.display();
   Serial.println(str);
 }
 
 void logPrint(String str) {
   display.print(str);
+  display.display();
   Serial.print(str);
 }
 
 void logPrintln(String str) {
   display.println(str);
+  display.display();
   Serial.println(str);
 }
 
 void logPrint(bool str) {
   display.print(str);
+  display.display();
   Serial.print(str);
 }
 
 void logPrintln(bool str) {
   display.println(str);
+  display.display();
   Serial.println(str);
 }
 
 void logPrint(float str) {
   display.print(str);
+  display.display();
   Serial.print(str);
 }
 
 void logPrintln(float str) {
   display.println(str);
+  display.display();
   Serial.println(str);
 }
 
 void logPrint(int str) {
   display.print(str);
+  display.display();
   Serial.print(str);
 }
 
 void logPrintln(int str) {
   display.println(str);
+  display.display();
+  Serial.println(str);
+}
+
+void logPrint(long str) {
+  display.print(str);
+  display.display();
+  Serial.print(str);
+}
+
+void logPrintln(long str) {
+  display.println(str);
+  display.display();
   Serial.println(str);
 }
 
@@ -360,26 +418,18 @@ void logDisplay() {
 }
 
 void readFromEeprom() {
-  EEPROM.begin(200);
-  // Locations that have never been written to have the value of 255.
-  int wateringTimeReadFromEeprom;
-  EEPROM.get(EEPROM_WATERING_TIME_ADDRESS, wateringTimeReadFromEeprom);
-  if (wateringTimeReadFromEeprom != 255) {
-    wateringTimeInSeconds = wateringTimeReadFromEeprom;
-  }
-
-  int autoWatering;
-  EEPROM.get(EEPROM_AUTO_WATERING_FLAG_ADDRESS, autoWatering);
-  if (autoWatering != 255) {
-    if (autoWatering == 0) {
-      triggerAutomaticallyWateringFlag = false;
-    } else if (autoWatering == 1) {
-      triggerAutomaticallyWateringFlag = true;
-    }
-  }
-
-  EEPROM.get(EEPROM_HOUR_OF_THE_LAST_WATERING_ADDRESS, hourOfTheLastWatering);
-  EEPROM.get(EEPROM_TIME_OF_THE_LAST_WATERING_ADDRESS, timeOfTheLastWatering);
+  preferences.begin("my−app", false);
+  wateringTimeInSeconds = preferences.getLong(EEPROM_WATERING_TIME_KEY, 0);
+  triggerAutomaticallyWateringFlag = preferences.getBool(EEPROM_AUTO_WATERING_FLAG_KEY, 0);
+  hourOfTheLastWatering = preferences.getInt(EEPROM_HOUR_OF_THE_LAST_WATERING_KEY, -1);
+  timeOfTheLastWatering = preferences.getString(EEPROM_TIME_OF_THE_LAST_WATERING_KEY, "defaultTime");
+  delay(50);
+  logPrint("Watering time in seconds: ");
+  logPrintln(wateringTimeInSeconds);
+  logPrint("Time of last watering: ");
+  logPrintln(timeOfTheLastWatering);
+  logDisplay();
+  preferences.end();
 }
 
 void sendMail() {
@@ -519,12 +569,18 @@ void sendTelemetry() {
   logPrint("%, Water: ");
   logPrint(waterLevelMoisturePercent);
   logPrintln("%");
+  logPrint("Rain drops: ");
+  logPrint(rainDropsPercent);
+  logPrintln("%");
   delay(200);
-
+  Serial.print("Time of last watering: ");
+  Serial.println(timeOfTheLastWatering);
+  Serial.print("Watering time in seconds: ");
+  Serial.println(wateringTimeInSeconds);
 
   if (!systemStartTimeSent) {
     char systemStartTimeCharBuf[50];
-    timeNow().toCharArray(systemStartTimeCharBuf, 50);
+    timeDateNow().toCharArray(systemStartTimeCharBuf, 50);
     tb.sendTelemetryString("systemStartTime", systemStartTimeCharBuf);
     systemStartTimeSent = true;
   }
@@ -535,13 +591,14 @@ void sendTelemetry() {
   tb.sendTelemetryInt("soilMoisturePercent1", soilMoisturePercent1);
   tb.sendTelemetryInt("soilMoisturePercent2", soilMoisturePercent2);
   tb.sendTelemetryInt("waterLevelMoisturePercent", waterLevelMoisturePercent);
+  tb.sendTelemetryInt("rainDropsPercent", rainDropsPercent);
   tb.sendTelemetryInt("wateringTimeInSeconds", wateringTimeInSeconds);
   tb.sendTelemetryBool("triggerAutomaticallyWateringFlag", triggerAutomaticallyWateringFlag);
   char updateTimeCharBuf[50];
-  timeNow().toCharArray(updateTimeCharBuf, 50);
+  timeDateNow().toCharArray(updateTimeCharBuf, 50);
   tb.sendTelemetryString("updateTime", updateTimeCharBuf);
-  char timeOfTheLastWateringCharBuf[50];
-  timeOfTheLastWatering.toCharArray(timeOfTheLastWateringCharBuf, 50);
+  char timeOfTheLastWateringCharBuf[100];
+  timeOfTheLastWatering.toCharArray(timeOfTheLastWateringCharBuf, 100);
   tb.sendTelemetryString("timeOfTheLastWatering", timeOfTheLastWateringCharBuf);
   delay(200);
   logPrintln("Telemetry sent.");
