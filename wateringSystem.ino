@@ -13,6 +13,7 @@
 #include <SPI.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_GFX.h>
+#include "Adafruit_VL53L0X.h"
 
 
 
@@ -24,7 +25,7 @@
 #define SCREEN_ADDRESS      0x3C
 
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
-char displayArray[21][8];
+Adafruit_VL53L0X laserSensor = Adafruit_VL53L0X();
 
 // PINOUTs
 const int PUMP_TRANSISTOR_PIN = 2;
@@ -72,18 +73,16 @@ bool triggerAutomaticallyWateringFlag = false;
 // Sensors
 const int moistureAirValue = 4200;
 const int moistureWaterValue = 0;
-// TODO check and adjust
 const int rainDropsAirValue = 4200;
 const int rainDropsWaterValue = 1500;
 int soilMoisturePercent1 = 0;
 int soilMoisturePercent2 = 0;
 int rainDropsPercent = 0;
-// TODO implement laser sensor
-int waterLevelMoisturePercent = 0;
 float temperature = 0;
 float humidity = 0;
 float current = 0;
 float batteryVoltage = 0;
+int waterLevelPercent = 0;
 
 // Misc
 DHT dht(DHT_PIN, DHTTYPE);
@@ -91,6 +90,7 @@ DHT dht(DHT_PIN, DHTTYPE);
 void setup() {
   Serial.begin(115200);
   dht.begin();
+
   display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
   display.display();
   display.clearDisplay();
@@ -103,7 +103,8 @@ void setup() {
   pinMode(PUMP_FLOWERS_PIN, OUTPUT);
   pinMode(PUMP_TOMATOS_PIN, OUTPUT);
   digitalWrite(SENSOR_TRANSISTOR_PIN, LOW); // turn off power for moisture sensors
-  // digitalWrite(PUMP_RELAY_PIN, HIGH); // stop pump manually without using stopPump(), because we use there WebSerial with WIFI
+  stopPump(PUMP_FLOWERS_PIN);
+  stopPump(PUMP_TOMATOS_PIN);
 
   readFromEeprom();
   
@@ -136,13 +137,19 @@ void loop() {
   // }
   // delay(500);
   
-  // if (isNight() || lowBattery()) {
-  //   logPrintln("Going deep sleep");
-  //   logDisplay();
-  //   tb.sendTelemetryBool("deepSleep", true);
-  //   delay(500);
-  //   ESP.deepSleep(5 * 60e6); // 5 minutes 
-  // }
+  if (isNight() || lowBattery()) {
+    if (isNight()) {
+      logPrintln("Night.");
+    } else {
+      logPrintln("Low battery.");
+    }
+    logPrintln("Going deep sleep");
+    logDisplay();
+    tb.sendTelemetryBool("deepSleep", true);
+    delay(500);
+    ESP.deepSleep(5 * 60e6); // 5 minutes 
+  }
+  // not necessary with ESP32?
   // else if (moreThanFiveMinutesFromSystemStart()) {
   //   logPrintln("Restarting");
   //   logDisplay();
@@ -150,16 +157,10 @@ void loop() {
   //   delay(500);
   //   ESP.deepSleep(1e6); // 1 second 
   // }
-  // else {
-  //   tb.sendTelemetryBool("deepSleep", false);
-  //   delay(10 * 1000); // 10 seconds
-  // }
-  // TODO remove
-  // logPrintln("Sleep");
-  // logDisplay();
-  // esp_sleep_enable_timer_wakeup(1e6 * 60 * 5);
-  // esp_deep_sleep_start();
-  delay(5000);
+  else {
+    tb.sendTelemetryBool("deepSleep", false);
+    delay(10 * 1000); // 10 seconds
+  }
 }
 
 /* --------------- WATERING --------------- */
@@ -243,9 +244,10 @@ void stopPump(int pPumpPin) {
   digitalWrite(pPumpPin, LOW);  
 }
 
-
 /* --------------- SENSORS --------------- */
 void measureSensorValues() {
+  logPrintln("Starting sensor measurement.");
+  logPrintln("DHT");
   // turn on power for moisture sensors
   digitalWrite(SENSOR_TRANSISTOR_PIN, HIGH);
   delay(500);
@@ -255,11 +257,31 @@ void measureSensorValues() {
   delay(100);
   humidity = dht.readHumidity();
   delay(100);
+  logPrintln("Battery voltage");
   measureBatteryVoltage();
   delay(5);
+  logPrintln("Moisture sensors");
   measureMoistureSensors();
+  delay(5);
+  logPrintln("Laser water level");
+  measureWaterLevel();
   // turn off power for moisture sensors
   digitalWrite(SENSOR_TRANSISTOR_PIN, LOW);
+  logPrintln("End of measurements");
+  logDisplay();
+}
+
+void measureWaterLevel() {
+  if (!laserSensor.begin()){
+    logPrintln("Failed to boot laser sensor");
+    waterLevelPercent = 999;
+    return;
+  }
+  delay(50);
+  VL53L0X_RangingMeasurementData_t measure;
+  laserSensor.rangingTest(&measure, false); // pass in 'true' to get debug data printout!
+  float laserSensorDistance = measure.RangeMilliMeter / 10.0;
+  waterLevelPercent = map(laserSensorDistance, 15.0, 0.0, 0, 100);
 }
 
 void measureMoistureSensors() {
@@ -281,16 +303,21 @@ void measureMoistureSensors() {
   soilMoisturePercent1 = map(analogValueSoilMoisture1, moistureAirValue, moistureWaterValue+200, 0, 100);
   soilMoisturePercent2 = map(analogValueSoilMoisture2, moistureAirValue, moistureWaterValue, 0, 100);
   rainDropsPercent = map(analogValueRainDrops, rainDropsAirValue, rainDropsWaterValue, 0, 100);
-  //waterLevelMoisturePercent = map(adcValueWaterLevel, moistureAirValue+100, moistureWaterValue+130, 0, 100);
 }
 
 void measureBatteryVoltage() {
   float calibration = 0.8;
   float refVoltage = 20.566;
-  int adcValue = analogRead(BATT_V_PIN);
-  delay(5);
-  float adcVoltage  = refVoltage * (adcValue / 4096.0); 
-  batteryVoltage = adcVoltage + calibration;
+  float batteryVoltageSum = 0.0;
+  for (int i=0;i<10;i++)
+  {
+    int adcValue = analogRead(BATT_V_PIN);
+    delay(5);
+    float adcVoltage  = refVoltage * (adcValue / 4096.0); 
+    batteryVoltageSum = batteryVoltageSum + adcVoltage + calibration;
+  }
+
+  batteryVoltage = batteryVoltageSum / 10.0;
 }
 
 /* --------------- MQQT --------------- */
@@ -504,12 +531,12 @@ void smtpCallback(SMTP_Status status) {
 }
 
 bool lowBattery() {
-  // 3.9 for LiPo, 3.4 for LiIon
-  return batteryVoltage < 3.9;
+  // 3.8 for LiPo, 3.4 for LiIon
+  return batteryVoltage < 3.8;
 }
 
 bool lowWaterLevel() {
-  return waterLevelMoisturePercent < 20;
+  return waterLevelPercent < 20;
 }
 
 void initWiFi() {
@@ -567,7 +594,7 @@ void sendTelemetry() {
   logPrint("%, Soil2: ");
   logPrint(soilMoisturePercent2);
   logPrint("%, Water: ");
-  logPrint(waterLevelMoisturePercent);
+  logPrint(waterLevelPercent);
   logPrintln("%");
   logPrint("Rain drops: ");
   logPrint(rainDropsPercent);
@@ -588,9 +615,9 @@ void sendTelemetry() {
   tb.sendTelemetryFloat("temperature", temperature);
   tb.sendTelemetryFloat("humidity", humidity);
   tb.sendTelemetryFloat("batteryVoltage", batteryVoltage);
+  tb.sendTelemetryInt("waterLevelPercent", waterLevelPercent);
   tb.sendTelemetryInt("soilMoisturePercent1", soilMoisturePercent1);
   tb.sendTelemetryInt("soilMoisturePercent2", soilMoisturePercent2);
-  tb.sendTelemetryInt("waterLevelMoisturePercent", waterLevelMoisturePercent);
   tb.sendTelemetryInt("rainDropsPercent", rainDropsPercent);
   tb.sendTelemetryInt("wateringTimeInSeconds", wateringTimeInSeconds);
   tb.sendTelemetryBool("triggerAutomaticallyWateringFlag", triggerAutomaticallyWateringFlag);
@@ -642,7 +669,7 @@ String timeDateNow() {
 }
 
 bool isNight() {
-  return hourNow() < 8 || hourNow() > 19;
+  return hourNow() < 8 || hourNow() > 20;
 }
 
 bool timeToSendMail() {
